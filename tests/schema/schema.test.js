@@ -206,7 +206,8 @@ describe('3. CHECK 제약 조건', () => {
     const validTypes = [
       'SQLI_BLOCKED', 'BRUTE_FORCE', 'INVALID_QR', 'REPLAY_QR',
       'LOCATION_MISMATCH', 'CHAIN_BROKEN', 'PAYMENT_OK', 'AI_ALERT',
-      'QR_REVOKED_USED', 'QR_EXPIRED_USED',
+      'QR_REVOKED_USED', 'QR_EXPIRED_USED', 'ACCOUNT_LOCKED',
+      'INVALID_DEMO_TOKEN', 'DEMO_GUEST_CREATED'
     ];
     for (const eventType of validTypes) {
       const { data, error } = await admin.from('security_events').insert({
