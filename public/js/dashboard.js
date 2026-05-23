@@ -1,31 +1,30 @@
 const EVENT_TYPES = [
-  'SQLI_DETECTED', 'LOGIN_FAIL', 'ACCOUNT_LOCKED',
+  'SQLI_BLOCKED', 'BRUTE_FORCE',
   'INVALID_QR', 'REPLAY_QR', 'LOCATION_MISMATCH',
   'PAYMENT_OK', 'AI_ALERT',
 ];
 
 const CHART_COLORS = {
-  SQLI_DETECTED: '#dc2626',
-  LOGIN_FAIL: '#ea580c',
-  ACCOUNT_LOCKED: '#b91c1c',
-  INVALID_QR: '#7c3aed',
-  REPLAY_QR: '#6d28d9',
+  SQLI_BLOCKED:      '#dc2626',
+  BRUTE_FORCE:       '#ea580c',
+  INVALID_QR:        '#7c3aed',
+  REPLAY_QR:         '#6d28d9',
   LOCATION_MISMATCH: '#d97706',
   PAYMENT_OK: '#16a34a',
   AI_ALERT: '#0891b2',
 };
 
 const DOT_CLASS_MAP = {
-  SQLI_DETECTED: 'sqli',
-  SQLI_BLOCKED: 'sqli',
-  LOGIN_FAIL: 'brute',
-  BRUTE_FORCE: 'brute',
-  ACCOUNT_LOCKED: 'brute',
-  INVALID_QR: 'qr',
-  REPLAY_QR: 'qr',
+  SQLI_BLOCKED:      'sqli',
+  BRUTE_FORCE:       'brute',
+  INVALID_QR:        'qr',
+  REPLAY_QR:         'qr',
   LOCATION_MISMATCH: 'qr',
-  PAYMENT_OK: 'ok',
-  AI_ALERT: 'ai',
+  CHAIN_BROKEN:      'qr',
+  QR_REVOKED_USED:   'qr',
+  QR_EXPIRED_USED:   'qr',
+  PAYMENT_OK:        'ok',
+  AI_ALERT:          'ai',
 };
 
 let chart = null;
