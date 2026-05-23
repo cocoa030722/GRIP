@@ -38,8 +38,18 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`GRIP server  → http://localhost:${PORT}`);
   console.log(`Health check → http://localhost:${PORT}/api/health`);
   aiAnalyzer.startAnalysisLoop();
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[오류] 포트 ${PORT}가 이미 사용 중입니다.`);
+    console.error(`실행 중인 서버를 먼저 종료하거나 PORT 환경변수를 변경하세요.`);
+    process.exit(1);
+  } else {
+    throw err;
+  }
 });

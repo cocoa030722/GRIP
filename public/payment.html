@@ -33,10 +33,7 @@
       <h2 class="section-title">QR 결제</h2>
 
       <form class="payment-form" id="paymentForm">
-        <div class="form-group">
-          <label for="qrPayload">QR 페이로드</label>
-          <input type="text" id="qrPayload" name="qr_payload" required placeholder="QR을 스캔하거나 페이로드를 입력하세요" />
-        </div>
+        <input type="hidden" id="qrPayload" name="qr_payload" />
 
         <div class="form-group">
           <label for="payAmount">결제 금액 (원)</label>

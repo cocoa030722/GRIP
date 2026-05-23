@@ -104,13 +104,27 @@ async function handleQrGenerate(e) {
   }
 
   const { qr_id, qr_payload } = data.data;
-  document.getElementById('qrId').textContent      = qr_id;
-  document.getElementById('qrDisplay').textContent = qr_payload;
+  document.getElementById('qrId').textContent = qr_id;
+
+  const paymentUrl = `https://grip-production-3249.up.railway.app/payment.html?payload=${encodeURIComponent(qr_payload)}&amount=${amount}`;
+
+  const qrEl = document.getElementById('qrDisplay');
+  qrEl.innerHTML = '';
+  new QRCode(qrEl, {
+    text: paymentUrl,
+    width: 256,
+    height: 256,
+    colorDark: '#000000',
+    colorLight: '#ffffff',
+    correctLevel: QRCode.CorrectLevel.M,
+  });
+
   document.getElementById('qrResult').classList.remove('hidden');
 }
 
 function handleQrRefresh() {
   document.getElementById('qrResult').classList.add('hidden');
+  document.getElementById('qrDisplay').innerHTML = '';
   document.getElementById('qrAmount').value = '';
   document.getElementById('qrError').textContent = '';
   document.getElementById('qrAmount').focus();
@@ -147,6 +161,12 @@ async function initConsumer() {
   API.renderNav(user);
   document.getElementById('consumerEmail').textContent   = user.email;
   document.getElementById('consumerBalance').textContent = (user.balance ?? 0).toLocaleString();
+
+  const params = new URLSearchParams(window.location.search);
+  const payloadParam = params.get('payload');
+  const amountParam  = params.get('amount');
+  if (payloadParam) document.getElementById('qrPayload').value = payloadParam;
+  if (amountParam)  document.getElementById('payAmount').value  = amountParam;
 
   await requestConsumerLocation();
   await loadConsumerTxHistory();
