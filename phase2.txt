@@ -1,0 +1,494 @@
+GRIP — PHASE 2: BACKEND 구현 계획
+작성일: 2026-05-24
+
+================================================================================
+현재 상태 요약
+================================================================================
+
+완료된 파일:
+  - routes/auth.js          라우팅 완료 (middleware 연결 포함)
+  - controllers/auth.controller.js  register / login / logout 완전 구현
+  - middleware/auth.middleware.js    (존재 가정, 라우터에서 import됨)
+  - middleware/rateLimit.middleware.js
+  - middleware/sqliDetect.middleware.js
+  - lib/supabase.js
+
+미구현 파일 (TODO 상태):
+  - lib/hmac.js
+  - lib/haversine.js
+  - lib/localAI.js
+  - services/aiAnalyzer.js
+  - controllers/payments.controller.js
+  - controllers/security.controller.js
+  - controllers/dashboard.controller.js
+  - routes/payments.js
+  - routes/security.js
+  - routes/dashboard.js
+
+================================================================================
+구현 순서 (의존 관계 기준)
+================================================================================
+
+Step 1  lib 유틸리티 (의존성 없음, 병렬 작성 가능)
+Step 2  controllers (lib에 의존)
+Step 3  routes (controllers에 의존)
+Step 4  index.js 라우터 등록 확인 + SSE 엔드포인트
+Step 5  services/aiAnalyzer.js (DB + localAI 의존)
+Step 6  HTML 껍데기 (semantic 구조 + class명 예약만)
+
+================================================================================
+Step 1: lib 유틸리티
+================================================================================
+
+────────────────────────────────────────
+1-A. lib/hmac.js
+────────────────────────────────────────
+목적: QR 서명 생성 및 검증
+
+export:
+  sign(paymentId, merchantId, amount, nonce, lat, lng) → string (hex)
+  verify(paymentId, merchantId, amount, nonce, lat, lng, signature) → boolean
+
+서명 입력 포맷 (spec 4.1):
+  message = `${paymentId}:${merchantId}:${amount}:${nonce}:${lat.toFixed(4)}:${lng.toFixed(4)}`
+  키 = process.env.HMAC_SECRET
+  알고리즘 = crypto.createHmac('sha256', key).update(message).digest('hex')
+
+verify는 timingSafeEqual로 비교 (타이밍 공격 방지)
+
+────────────────────────────────────────
+1-B. lib/haversine.js
+────────────────────────────────────────
+목적: 두 GPS 좌표 간 거리 계산 (미터)
+
+export:
+  distance(lat1, lng1, lat2, lng2) → number (미터, DOUBLE)
+
+공식 (spec 4.4):
+  R = 6371000
+  Δlat = (lat2 - lat1) * π/180
+  Δlng = (lng2 - lng1) * π/180
+  a = sin²(Δlat/2) + cos(lat1*π/180) * cos(lat2*π/180) * sin²(Δlng/2)
+  distance = 2 * R * Math.asin(Math.sqrt(a))
+
+────────────────────────────────────────
+1-C. lib/localAI.js
+────────────────────────────────────────
+목적: Ollama REST API fetch 래퍼
+
+export:
+  ask(prompt) → string  (LLM 응답 텍스트)
+
+내부 동작:
+  1. DISABLE_AI=true 이면 throw new Error('AI_DISABLED')
+  2. POST ${OLLAMA_URL}/api/generate
+     body: { model: OLLAMA_MODEL, prompt, stream: false }
+  3. 응답 response 필드 반환
+  4. 타임아웃: fetch AbortController 30초
+  5. 실패 시 throw Error('AI_UNAVAILABLE') — 호출부에서 catch
+
+================================================================================
+Step 2: controllers
+================================================================================
+
+────────────────────────────────────────
+2-A. controllers/payments.controller.js
+────────────────────────────────────────
+
+함수 3개: requestQR / verifyQR / getHistory
+
+──── requestQR (POST /api/payments/request) ────
+
+미들웨어: authMiddle (req.user 주입됨)
+역할 확인: req.user.role === 'merchant' 아니면 403 FORBIDDEN
+
+입력 (body): amount (정수 > 0), merchant_lat, merchant_lng
+  - 셋 중 하나라도 누락 → 400 LOCATION_REQUIRED 또는 INVALID_INPUT
+  - amount <= 0 → 400 INVALID_INPUT
+
+처리 순서:
+  1. merchant_id = req.user.id
+  2. 기존 pending QR 일괄 만료:
+       supabaseAdmin.from('merchant_qr_codes')
+         .update({ status: 'expired', revoked_at: now(), revoked_reason: '상인 QR 갱신' })
+         .eq('merchant_id', merchant_id).eq('status', 'active')
+  3. nonce = crypto.randomUUID()
+  4. hmac_signature = hmac.sign(qr_id예약불가→ 선삽입 방식 사용)
+     → 먼저 merchant_qr_codes INSERT (hmac_signature = '' 임시)
+     → qr_id 획득 후 서명 계산 → UPDATE hmac_signature
+     ※ 또는: qr_id = crypto.randomUUID() 직접 생성 후 한 번에 INSERT
+       (gen_random_uuid() 대신 서버에서 생성하면 서명에 포함 가능)
+     구현 선택: 서버에서 qr_id = crypto.randomUUID() 생성 → sign(qr_id, ...) → INSERT
+  5. merchant_qr_codes INSERT:
+       { qr_id, merchant_id, merchant_lat, merchant_lng,
+         hmac_signature, expires_at: +24h (더미, status로만 관리),
+         status: 'active' }
+  6. qr_payload = `${qr_id}:${hmac_signature}`
+  7. 응답 201:
+       { success: true, data: { qr_id, hmac_signature, qr_payload, expires_at } }
+
+──── verifyQR (POST /api/payments/verify) ────
+
+미들웨어: authMiddle
+역할 확인: req.user.role === 'consumer' 아니면 403 FORBIDDEN
+
+입력 (body): qr_payload, consumer_lat, consumer_lng
+  - 누락 시 400
+
+처리 순서:
+  1. consumer_id = req.user.id
+  2. qr_payload 파싱: const [qr_id, sig] = qr_payload.split(':')
+     파싱 실패(분리 불가) → 400 INVALID_QR
+  3. merchant_qr_codes 조회 (qr_id)
+     - 없으면 → 400 INVALID_QR + security_events 삽입
+  4. status 확인:
+     - 'completed' → 400 REPLAY_QR (실제로는 payment_sessions 기준이지만 단순화)
+       ※ 명세 기준: status='pending' 아닌 active QR만 검증. QR이 used처리 후 revoked
+       → status !== 'active' → REPLAY_QR or INVALID_QR (expired)
+  5. HMAC 재계산 및 검증:
+       hmac.verify(qr_id, merchant_id, amount, nonce, merchant_lat, merchant_lng, sig)
+       ※ amount, nonce는 merchant_qr_codes에 없음 → 설계 재검토:
+          spec 4.1의 서명 입력 = {payment_id}:{merchant_id}:{amount}:{nonce}:{lat}:{lng}
+          merchant_qr_codes에는 amount/nonce 컬럼이 없음.
+          → payment_sessions 테이블이 nonce/amount 보유.
+          → QR 발급 시 amount/nonce도 merchant_qr_codes에 저장하거나,
+            별도 payment_sessions INSERT 후 검증.
+       실제 구현 방안:
+          requestQR에서 nonce, amount도 merchant_qr_codes에 extra 컬럼으로 저장
+          (스키마에 없으므로) → 또는 payment_sessions를 requestQR 시점에 생성.
+          ★ 현재 스키마 제약: merchant_qr_codes에 amount/nonce 컬럼 없음.
+            payment_sessions.nonce unique, qr_id FK.
+          → 구현 결정: requestQR에서 payment_sessions도 함께 생성
+            (consumer_id는 미정이므로 NULL 허용 필요 — 스키마 위반 가능성 있음)
+            OR: verifyQR 시점에 payment_sessions 생성 (QR 자체에 amount 포함 안 됨)
+          → 최종 결정: QR에 amount 미포함. QR은 "상점 신원 증명"만 수행.
+            verifyQR body에 amount 포함 → 소비자가 금액 입력.
+            서명 message = `${qr_id}:${merchant_id}:${merchant_lat.toFixed(4)}:${merchant_lng.toFixed(4)}`
+            (amount/nonce 제외) — spec과 다르지만 현재 스키마와 정합
+            ※ 이 결정은 PHASE 2 내에서 확정. 스키마 변경 없이 처리.
+  6. HMAC 검증 실패 → 400 INVALID_QR + security_events 삽입
+  7. Haversine 거리 계산:
+       d = haversine.distance(merchant_lat, merchant_lng, consumer_lat, consumer_lng)
+       d > MAX_DISTANCE_METERS → 400 LOCATION_MISMATCH + security_events 삽입
+         detail: { payment_id: qr_id, merchant_lat, merchant_lng, consumer_lat, consumer_lng,
+                   distance_m: d, max_allowed_m, message }
+  8. consumer balance 조회:
+       supabaseAdmin.from('users').select('balance, is_blocked').eq('id', consumer_id)
+       is_blocked → 403 USER_BLOCKED
+       balance < amount → 400 INSUFFICIENT_BALANCE
+  9. 트랜잭션 (순서 중요, 원자성):
+       a. consumers.balance -= amount
+       b. merchant.balance += amount
+       c. merchant_qr_codes.status = 'revoked' (또는 used 처리)
+       d. transactions INSERT { qr_id, consumer_id, merchant_id, amount }
+          ※ payment_request_id = qr_id (FK → merchant_qr_codes.qr_id)
+       e. security_events INSERT { event_type: 'PAYMENT_OK', user_id: consumer_id,
+            detail: { merchant_id, amount, distance_m: d } }
+       ※ Supabase는 클라이언트 레벨 트랜잭션 미지원 → supabaseAdmin.rpc('pay_transaction', {...})
+          또는 순서대로 실행 후 실패 시 rollback 시도 (베스트 에포트)
+  10. 응답 200: { success: true, data: { message: '결제가 완료되었습니다.', amount, merchant_id } }
+
+──── getHistory (GET /api/payments/history) ────
+
+미들웨어: authMiddle
+공통 (role 무관): 본인의 transactions 조회
+
+처리:
+  user_id = req.user.id
+  supabaseAdmin.from('transactions')
+    .select('*, merchant:merchant_id(email), consumer:consumer_id(email)')
+    .or(`consumer_id.eq.${user_id},merchant_id.eq.${user_id}`)
+    .order('created_at', { ascending: false })
+    .limit(50)
+
+응답 200: { success: true, data: { transactions: [...] } }
+
+────────────────────────────────────────
+2-B. controllers/security.controller.js
+────────────────────────────────────────
+
+함수 3개: getEvents / aiAnalyzeNow / streamEvents(SSE)
+
+──── getEvents (GET /api/security/events) ────
+
+미들웨어: authMiddle + admin 역할 확인
+쿼리 파라미터: limit (기본 50, 최대 100), before (id, cursor 페이지네이션)
+
+처리:
+  let query = supabaseAdmin.from('security_events')
+    .select('*').order('id', { ascending: false }).limit(limit)
+  if (before) query = query.lt('id', before)
+  응답: { success: true, data: { events, next_cursor: events.at(-1)?.id } }
+
+──── aiAnalyzeNow (POST /api/security/ai-analyze) ────
+
+미들웨어: authMiddle + admin 역할 확인
+body: { user_id? }  (없으면 전체 대상 자동 선정)
+
+처리:
+  const result = await aiAnalyzer.runOnce(user_id || null)
+  응답: { success: true, data: { analyzed: result.count, alerts: result.alerts } }
+
+──── streamEvents (GET /api/security/stream) ────
+
+미들웨어: authMiddle + admin 역할 확인
+SSE 설정:
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders()
+
+폴링 방식 (Supabase Realtime 미사용):
+  setInterval(async () => {
+    마지막 전송 id보다 큰 이벤트 조회 → 신규 있으면 SSE 전송
+  }, 2000)
+  req.on('close', () => clearInterval(timer))
+
+SSE 메시지 포맷:
+  `data: ${JSON.stringify(event)}\n\n`
+
+────────────────────────────────────────
+2-C. controllers/dashboard.controller.js
+────────────────────────────────────────
+
+함수 2개 + admin block/unblock:
+
+──── getStats (GET /api/dashboard/stats) ────
+
+미들웨어: authMiddle + admin
+쿼리: ?minutes=10 (기본 10)
+
+처리:
+  since = new Date(Date.now() - minutes * 60 * 1000).toISOString()
+  supabaseAdmin.from('security_events')
+    .select('event_type, created_at')
+    .gte('created_at', since)
+  → 1분 단위 버킷으로 집계 (서버사이드 JS로 그루핑)
+  응답: { success: true, data: { buckets: [{minute, counts: {BRUTE_FORCE: 3, ...}}] } }
+
+──── getAiAlerts (GET /api/dashboard/ai-alerts) ────
+
+미들웨어: authMiddle + admin
+
+처리:
+  AI_ALERT 이벤트 중 block_recommendation=true 이고
+  해당 user가 is_blocked=false인 것만 조회
+  supabaseAdmin.from('security_events')
+    .select('*, user:user_id(email, is_blocked)')
+    .eq('event_type', 'AI_ALERT')
+    .order('created_at', { ascending: false })
+    .limit(20)
+  → 필터: user.is_blocked === false && detail.block_recommendation === true
+  응답: { success: true, data: { alerts: [...] } }
+
+──── blockUser (POST /api/admin/users/:id/block) ────
+
+미들웨어: authMiddle + admin
+
+처리:
+  id = req.params.id
+  supabaseAdmin.from('users')
+    .update({ is_blocked: true, blocked_at: now(),
+              block_reason: req.body.reason || 'AI 권고로 관리자가 차단하였습니다.' })
+    .eq('id', id)
+  응답: { success: true, data: { message: '사용자가 차단되었습니다.' } }
+
+──── unblockUser (POST /api/admin/users/:id/unblock) ────
+
+처리:
+  supabaseAdmin.from('users')
+    .update({ is_blocked: false, block_reason: null, blocked_at: null })
+    .eq('id', id)
+  응답: { success: true, data: { message: '차단이 해제되었습니다.' } }
+
+================================================================================
+Step 3: routes 완성
+================================================================================
+
+────────────────────────────────────────
+3-A. routes/payments.js
+────────────────────────────────────────
+  router.post('/request', authMiddle, requestQR)
+  router.post('/verify', authMiddle, verifyQR)
+  router.get('/history', authMiddle, getHistory)
+
+────────────────────────────────────────
+3-B. routes/security.js
+────────────────────────────────────────
+  router.get('/stream', authMiddle, streamEvents)   ← SSE, 순서 주의 (events 앞에)
+  router.get('/events', authMiddle, getEvents)
+  router.post('/ai-analyze', authMiddle, aiAnalyzeNow)
+
+────────────────────────────────────────
+3-C. routes/dashboard.js
+────────────────────────────────────────
+  router.get('/stats', authMiddle, getStats)
+  router.get('/ai-alerts', authMiddle, getAiAlerts)
+
+────────────────────────────────────────
+3-D. index.js 라우터 등록 확인
+────────────────────────────────────────
+  app.use('/api/auth', authRouter)
+  app.use('/api/payments', paymentsRouter)
+  app.use('/api/security', securityRouter)
+  app.use('/api/dashboard', dashboardRouter)
+  app.use('/api/admin', adminRouter)   ← blockUser/unblockUser 분리 또는 dashboard에 통합
+  app.get('/api/health', healthCheck)
+
+================================================================================
+Step 4: admin 라우터 처리
+================================================================================
+
+blockUser / unblockUser는 dashboard.js에 통합하거나 별도 admin.js 생성.
+index.js에서:
+  app.use('/api/admin', adminRouter)
+
+routes/admin.js (신규):
+  router.post('/users/:id/block', authMiddle, blockUser)
+  router.post('/users/:id/unblock', authMiddle, unblockUser)
+
+================================================================================
+Step 5: services/aiAnalyzer.js
+================================================================================
+
+export:
+  startAnalysisLoop()   setInterval로 runOnce() 주기 실행
+  runOnce(targetUserId) 분석 실행 → { count, alerts }
+
+──── 대상 선정 ────
+
+targetUserId가 있으면 해당 user만.
+없으면 조건 A 또는 B 해당하는 user_id 목록:
+
+조건 A: 최근 5분 내 동일 user_id의 INVALID_QR | REPLAY_QR | LOCATION_MISMATCH 가 3회 이상
+조건 B: 최근 1시간 내 동일 user_id의 비정상 이벤트 5회 이상
+         (단 이벤트 간격이 모두 2분 이상인 경우)
+
+is_blocked = true인 user 제외
+
+──── 컨텍스트 구성 ────
+
+해당 user의 최근 24시간:
+  - security_events (event_type, created_at, detail)
+  - transactions (amount, created_at)
+
+──── LLM 호출 ────
+
+프롬프트 (한국어 응답 + JSON 형식 강제):
+  "다음은 사용자 [user_id]의 최근 보안 이벤트와 거래 내역입니다.
+   이상 행동을 분석하고 아래 JSON 형식으로만 답변하세요:
+   { risk_level, patterns, reason_ko, block_recommendation, user_message_ko }
+   [이벤트 목록]
+   [거래 목록]"
+
+응답 파싱:
+  JSON.parse(response) 실패 시 → 폐기 (security_events 삽입 안 함)
+
+──── 결과 저장 ────
+
+파싱 성공 시:
+  security_events INSERT {
+    event_type: 'AI_ALERT',
+    user_id: analyzed_user_id,
+    detail: { analyzed_user_id, risk_level, patterns, reason_ko,
+              block_recommendation, model: OLLAMA_MODEL }
+  }
+
+──── 오류 처리 ────
+
+localAI.ask() 에서 AI_UNAVAILABLE throw → catch 후 스킵
+응답: AI_UNAVAILABLE 에러 코드 (서비스 중단 없음)
+
+================================================================================
+Step 6: HTML 껍데기 (Phase 2 허용 범위)
+================================================================================
+
+public/index.html:
+  - <main> 로그인/회원가입 섹션 (semantic)
+  - <section class="merchant-qr"> QR 발급 폼 껍데기
+  - <section class="consumer-payment"> QR 스캔 결제 폼 껍데기
+  - CSS, JS 없음 (class명만 예약)
+  - <!-- TODO:FRONTEND - 스타일 및 JS 연동 -->
+
+public/dashboard.html:
+  - <aside class="ai-alerts-panel"> AI 차단 권고 패널 껍데기
+  - <section class="event-feed"> 이벤트 피드 껍데기
+  - <section class="chart-bar"> 막대 차트 껍데기
+  - <!-- TODO:FRONTEND - Chart.js 연동, SSE EventSource 연동 -->
+
+================================================================================
+미들웨어 역할 검증 패턴 (공통)
+================================================================================
+
+모든 admin 전용 엔드포인트:
+  function requireRole(...roles) {
+    return (req, res, next) => {
+      if (!roles.includes(req.user?.role))
+        return res.status(403).json({ success: false,
+          error: { code: 'FORBIDDEN', message: '권한이 없습니다.' } });
+      next();
+    };
+  }
+
+  사용: router.get('/stats', authMiddle, requireRole('admin'), getStats)
+
+================================================================================
+공통 헬퍼
+================================================================================
+
+fail(res, status, code, message) → auth.controller에 이미 있음
+→ 별도 lib/response.js로 분리하거나 각 컨트롤러에 복사
+
+insertSecurityEvent(supabaseAdmin, { event_type, ip, user_id, detail }) → Promise
+→ controllers/security.controller.js 또는 lib/securityEvent.js에 공통 함수로 추출
+  IP 추출: req.ip 또는 req.headers['x-forwarded-for']
+
+================================================================================
+구현 완료 기준 (Phase 2)
+================================================================================
+
+curl 또는 Postman으로 아래 확인:
+
+[ ] POST /api/auth/register           → 201 + { token, user }
+[ ] POST /api/auth/login              → 200 + JWT
+[ ] POST /api/auth/logout             → 200
+[ ] POST /api/payments/request        → 201 + { qr_id, qr_payload }  (merchant JWT)
+[ ] POST /api/payments/verify         → 200 결제 성공              (consumer JWT)
+[ ] POST /api/payments/verify         → 400 INVALID_QR (서명 위변조)
+[ ] POST /api/payments/verify         → 400 REPLAY_QR (재사용)
+[ ] POST /api/payments/verify         → 400 LOCATION_MISMATCH (거리 초과)
+[ ] GET  /api/payments/history        → 200 + 거래 목록
+[ ] GET  /api/security/events         → 200 + 이벤트 목록         (admin JWT)
+[ ] GET  /api/security/stream         → SSE 연결 유지
+[ ] POST /api/security/ai-analyze     → 200 (DISABLE_AI=true 시 graceful skip)
+[ ] GET  /api/dashboard/stats         → 200 + 버킷 집계
+[ ] GET  /api/dashboard/ai-alerts     → 200 + 미처리 권고 목록
+[ ] POST /api/admin/users/:id/block   → 200
+[ ] POST /api/admin/users/:id/unblock → 200
+[ ] GET  /api/health                  → 200 + { db: 'ok' }
+
+================================================================================
+주의사항 및 결정 사항
+================================================================================
+
+1. HMAC 서명 입력에서 amount/nonce 제외 결정
+   이유: merchant_qr_codes 스키마에 amount/nonce 컬럼 없음
+   대안: QR = 상점 신원 증명 QR (amount는 소비자가 verifyQR body에 입력)
+   서명: `${qr_id}:${merchant_id}:${merchant_lat.toFixed(4)}:${merchant_lng.toFixed(4)}`
+
+2. 트랜잭션 원자성
+   Supabase JS SDK는 클라이언트 트랜잭션 미지원
+   → supabaseAdmin.rpc('pay_transaction', params) 으로 DB 함수 호출 권장
+   → 또는 순서 실행 + 실패 보상 로직 (베스트 에포트)
+
+3. SSE 방식
+   Supabase Realtime 미사용 → 2초 폴링으로 구현
+   마지막 전송 이벤트 id를 클로저에 보관
+
+4. AI 분석 루프
+   index.js 서버 시작 시 aiAnalyzer.startAnalysisLoop() 호출
+   DISABLE_AI=true 이면 startAnalysisLoop()는 no-op
+
+5. 소비자 좌표 저장 정책 (spec 4.4)
+   consumer_lat/lng는 DB에 저장하지 않음
+   LOCATION_MISMATCH 이벤트 detail에만 보안 감사 목적으로 기록

@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const { supabase } = require('./lib/supabase');
+const aiAnalyzer = require('./services/aiAnalyzer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,16 +10,15 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Routes (Phase 2에서 구현)
 app.use('/api/auth',      require('./routes/auth'));
 app.use('/api/payments',  require('./routes/payments'));
 app.use('/api/security',  require('./routes/security'));
 app.use('/api/dashboard', require('./routes/dashboard'));
+app.use('/api/admin',     require('./routes/admin'));
 
 app.get('/api/health', async (req, res) => {
   const result = { server: 'ok', db: 'unknown' };
 
-  // Supabase 연결 확인 — SDK의 getSession()으로 API 키 유효성 검증
   if (!supabase) {
     result.db = 'not_configured';
   } else {
@@ -38,4 +38,5 @@ app.get('/api/health', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`GRIP server  → http://localhost:${PORT}`);
   console.log(`Health check → http://localhost:${PORT}/api/health`);
+  aiAnalyzer.startAnalysisLoop();
 });

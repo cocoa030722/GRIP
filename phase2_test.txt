@@ -1,0 +1,566 @@
+GRIP — PHASE 2 백엔드 테스트 계획
+작성일: 2026-05-24
+
+테스트 도구: supertest + node:test
+테스트 위치: tests/backend/
+실행 명령: npm run test:backend
+
+전제 조건:
+  - .env에 실제 Supabase 연결 정보 설정
+  - HMAC_SECRET 설정
+  - MAX_DISTANCE_METERS=100
+  - DISABLE_AI=true (AI 테스트는 별도 처리)
+  - 테스트 계정 3개 사전 등록 (merchant / consumer / admin)
+
+================================================================================
+1. 공통 응답 포맷 규칙 (모든 케이스에 적용)
+================================================================================
+
+성공 응답:  { success: true,  data: { ... } }
+실패 응답:  { success: false, error: { code: string, message: string } }
+
+HTTP 상태코드 매핑:
+  200  정상 응답
+  201  리소스 생성 성공
+  400  입력 오류 / QR 위변조 / 잔액 부족
+  401  인증 실패 / SQLi 탐지
+  403  계정 잠금 / 권한 없음 / 차단된 계정
+  404  리소스 없음
+  429  Rate limit 초과
+  500  서버 내부 오류
+
+================================================================================
+2. 인증 (tests/backend/auth.test.js)
+================================================================================
+
+────────────────────────────────────────
+2-1. POST /api/auth/register
+────────────────────────────────────────
+
+[ TC-R01 ] 정상 회원가입 (consumer)
+  입력: { email: "consumer@test.com", password: "password1", role: "consumer" }
+  기대: 201, success=true, data.user.role="consumer"
+
+[ TC-R02 ] 정상 회원가입 (merchant)
+  입력: { email: "merchant@test.com", password: "password1", role: "merchant" }
+  기대: 201, success=true
+
+[ TC-R03 ] 정상 회원가입 (admin)
+  입력: { email: "admin@test.com", password: "password1", role: "admin" }
+  기대: 201, success=true
+
+[ TC-R04 ] 중복 이메일
+  입력: TC-R01과 동일 이메일 재요청
+  기대: 400, error.code="EMAIL_EXISTS"
+
+[ TC-R05 ] 비밀번호 7자 (미달)
+  입력: { password: "short1" }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-R06 ] 유효하지 않은 이메일 형식
+  입력: { email: "notanemail" }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-R07 ] 유효하지 않은 role
+  입력: { role: "superuser" }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-R08 ] 필수 필드 누락 (email 없음)
+  입력: { password: "password1", role: "consumer" }
+  기대: 400, error.code="INVALID_INPUT"
+
+────────────────────────────────────────
+2-2. POST /api/auth/login
+────────────────────────────────────────
+
+[ TC-L01 ] 정상 로그인
+  입력: { email: "consumer@test.com", password: "password1" }
+  기대: 200, data.token (JWT 문자열), data.user.role="consumer"
+
+[ TC-L02 ] 잘못된 비밀번호
+  입력: { email: "consumer@test.com", password: "wrongpassword" }
+  기대: 401, error.code="INVALID_CREDENTIALS"
+
+[ TC-L03 ] 존재하지 않는 이메일
+  입력: { email: "nobody@test.com", password: "password1" }
+  기대: 401, error.code="INVALID_CREDENTIALS"
+  ※ 이메일 열거 방지: 존재 여부를 응답으로 구분 불가해야 함
+
+[ TC-L04 ] SQLi 탐지 — email 필드
+  입력: { email: "' OR '1'='1", password: "password1" }
+  기대: 401, error.code="SQLI_DETECTED"
+  검증: security_events에 SQLI_BLOCKED 이벤트 기록 확인
+
+[ TC-L05 ] SQLi 탐지 — password 필드
+  입력: { email: "test@test.com", password: "'; DROP TABLE users;--" }
+  기대: 401, error.code="SQLI_DETECTED"
+  검증: security_events에 SQLI_BLOCKED 이벤트 기록 확인
+
+[ TC-L06 ] SQLi 탐지 패턴 목록 (각각 개별 테스트)
+  패턴: ' / " / ; / -- / # / /* */ / UNION / SELECT / DROP / INSERT / UPDATE
+  기대: 모두 401, error.code="SQLI_DETECTED"
+
+[ TC-L07 ] Rate limit 초과 (분당 11회)
+  입력: 동일 IP에서 POST /api/auth/login 11회 연속 호출
+  기대: 1~10회는 통과, 11회째는 429, error.code="RATE_LIMITED"
+  검증: security_events에 BRUTE_FORCE 이벤트 기록 확인
+
+[ TC-L08 ] 계정 잠금 (5회 연속 실패)
+  입력: 동일 계정에 잘못된 비밀번호 5회
+  기대:
+    1~4회: 401, error.code="INVALID_CREDENTIALS"
+    5회:   403, error.code="ACCOUNT_LOCKED", error.unlock_at (ISO 타임스탬프)
+  검증: unlock_at이 현재 시각 + 약 30분임을 확인
+
+[ TC-L09 ] 잠긴 계정으로 즉시 재로그인
+  선행: TC-L08 완료
+  입력: 올바른 비밀번호로 로그인 시도
+  기대: 403, error.code="ACCOUNT_LOCKED", unlock_at 포함
+
+[ TC-L10 ] 필수 필드 누락
+  입력: {} (빈 바디)
+  기대: 400, error.code="INVALID_INPUT"
+
+────────────────────────────────────────
+2-3. POST /api/auth/logout
+────────────────────────────────────────
+
+[ TC-O01 ] 정상 로그아웃
+  헤더: Authorization: Bearer <valid_token>
+  기대: 200, success=true
+
+[ TC-O02 ] 토큰 없이 로그아웃
+  헤더: 없음
+  기대: 401, error.code="UNAUTHORIZED"
+
+================================================================================
+3. 결제 (tests/backend/payments.test.js)
+================================================================================
+
+────────────────────────────────────────
+3-1. POST /api/payments/request  (merchant only)
+────────────────────────────────────────
+
+[ TC-QR01 ] 정상 QR 발급 (merchant)
+  헤더: merchant JWT
+  입력: { amount: 5000, merchant_lat: 36.3504, merchant_lng: 127.3845 }
+  기대:
+    201, success=true
+    data.qr_id (UUID 형식)
+    data.qr_payload ("uuid:hexstring" 형식)
+    data.hmac_signature (64자 hex)
+    data.expires_at (ISO 타임스탬프)
+
+[ TC-QR02 ] consumer 토큰으로 QR 발급 시도
+  헤더: consumer JWT
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-QR03 ] admin 토큰으로 QR 발급 시도
+  헤더: admin JWT
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-QR04 ] 위치 정보 누락
+  헤더: merchant JWT
+  입력: { amount: 5000 }  (lat/lng 없음)
+  기대: 400, error.code="LOCATION_REQUIRED"
+
+[ TC-QR05 ] amount 0 이하
+  입력: { amount: 0, merchant_lat: 36.3504, merchant_lng: 127.3845 }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-QR06 ] amount 음수
+  입력: { amount: -100, merchant_lat: 36.3504, merchant_lng: 127.3845 }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-QR07 ] 새 QR 발급 시 이전 QR 만료 확인
+  선행: TC-QR01로 QR 발급 (qr_id_1 획득)
+  요청: 동일 merchant로 새 QR 발급 (qr_id_2 획득)
+  검증: DB에서 qr_id_1의 status='expired' 확인
+  기대: qr_id_2의 status='active'
+
+[ TC-QR08 ] 인증 토큰 없음
+  헤더: 없음
+  기대: 401, error.code="UNAUTHORIZED"
+
+────────────────────────────────────────
+3-2. POST /api/payments/verify  (consumer only)
+────────────────────────────────────────
+
+[ TC-V01 ] 정상 결제 성공
+  선행: merchant로 QR 발급 (위치: 36.3504, 127.3845)
+  헤더: consumer JWT (충분한 잔액 보유)
+  입력:
+    { qr_payload: "<qr_id>:<signature>",
+      consumer_lat: 36.3504,  consumer_lng: 127.3845,
+      amount: 5000 }
+  기대:
+    200, success=true
+    data.message = "결제가 완료되었습니다."
+    data.amount = 5000
+  검증:
+    consumer.balance 감소 확인
+    merchant.balance 증가 확인
+    transactions 테이블에 행 삽입 확인
+    security_events에 PAYMENT_OK 이벤트 확인
+    merchant_qr_codes.status = 'revoked' 확인
+
+[ TC-V02 ] merchant 토큰으로 결제 시도
+  헤더: merchant JWT
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-V03 ] QR 서명 위변조 (INVALID_QR)
+  입력: { qr_payload: "<valid_qr_id>:deadbeef0000000000000000000000000000000000000000000000000000000000", ... }
+  기대: 400, error.code="INVALID_QR"
+  검증: security_events에 INVALID_QR 이벤트 확인 (detail.message="QR 서명 불일치")
+
+[ TC-V04 ] 존재하지 않는 QR ID (INVALID_QR)
+  입력: { qr_payload: "00000000-0000-0000-0000-000000000000:deadbeef...", ... }
+  기대: 400, error.code="INVALID_QR"
+  검증: security_events에 INVALID_QR 이벤트 확인
+
+[ TC-V05 ] qr_payload 형식 오류 (콜론 없음)
+  입력: { qr_payload: "invalidformat", ... }
+  기대: 400, error.code="INVALID_QR"
+
+[ TC-V06 ] 이미 사용된 QR 재사용 (REPLAY_QR)
+  선행: TC-V01로 결제 완료
+  요청: 동일 qr_payload로 재결제 시도
+  기대: 400, error.code="REPLAY_QR"
+  검증: security_events에 REPLAY_QR 이벤트 확인
+
+[ TC-V07 ] 만료된 QR 사용 (INVALID_QR)
+  선행: merchant가 새 QR을 발급하여 이전 QR이 expired 처리됨
+  요청: 이전 qr_payload로 결제 시도
+  기대: 400, error.code="INVALID_QR"
+  검증: security_events에 INVALID_QR 이벤트 확인
+
+[ TC-V08 ] 위치 불일치 — 100m 초과 (LOCATION_MISMATCH)
+  선행: merchant로 QR 발급 (위치: 36.3504, 127.3845 — 대전)
+  입력:
+    { qr_payload: ...,
+      consumer_lat: 37.5665,  consumer_lng: 126.9780,  (서울 — 약 148km)
+      amount: 5000 }
+  기대: 400, error.code="LOCATION_MISMATCH"
+  검증:
+    security_events에 LOCATION_MISMATCH 이벤트 확인
+    detail.distance_m > 100 확인
+    detail.merchant_lat, merchant_lng, consumer_lat, consumer_lng 포함 확인
+    소비자 좌표가 DB transactions/payment_sessions에 저장되지 않음 확인
+
+[ TC-V09 ] 위치 불일치 경계값 — 정확히 100m
+  입력: consumer 위치를 상인 위치에서 정확히 100m 지점
+  기대: 200 (100m는 허용, > 100m만 차단)
+
+[ TC-V10 ] 잔액 부족 (INSUFFICIENT_BALANCE)
+  선행: consumer 잔액보다 큰 amount
+  기대: 400, error.code="INSUFFICIENT_BALANCE"
+  검증: consumer.balance 변화 없음 확인
+
+[ TC-V11 ] 위치 정보 누락
+  입력: { qr_payload: ..., amount: 5000 }  (lat/lng 없음)
+  기대: 400, error.code="LOCATION_REQUIRED"
+
+[ TC-V12 ] amount 누락
+  입력: { qr_payload: ..., consumer_lat: 36.3504, consumer_lng: 127.3845 }
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-V13 ] 차단된 소비자의 결제 시도
+  선행: consumer를 admin이 차단 처리
+  기대: 403, error.code="USER_BLOCKED"
+  검증: error.message가 AI 생성 차단 사유 문자열임을 확인
+
+[ TC-V14 ] 인증 토큰 없음
+  기대: 401, error.code="UNAUTHORIZED"
+
+────────────────────────────────────────
+3-3. GET /api/payments/history
+────────────────────────────────────────
+
+[ TC-H01 ] consumer의 거래 내역 조회
+  선행: TC-V01 결제 완료
+  헤더: consumer JWT
+  기대: 200, data.transactions 배열 (1건 이상), 최신순 정렬
+  검증: 각 항목에 merchant.email, consumer.email 포함 확인
+
+[ TC-H02 ] merchant의 거래 내역 조회
+  헤더: merchant JWT
+  기대: 200, data.transactions (자신이 수신한 거래 포함)
+
+[ TC-H03 ] 거래 없는 신규 user
+  기대: 200, data.transactions = []
+
+[ TC-H04 ] 인증 없이 접근
+  기대: 401, error.code="UNAUTHORIZED"
+
+================================================================================
+4. 보안 이벤트 (tests/backend/security.test.js)
+================================================================================
+
+────────────────────────────────────────
+4-1. GET /api/security/events  (admin only)
+────────────────────────────────────────
+
+[ TC-E01 ] admin이 이벤트 목록 조회
+  헤더: admin JWT
+  기대: 200, data.events (배열), data.next_cursor
+
+[ TC-E02 ] limit 파라미터
+  URL: /api/security/events?limit=5
+  기대: 200, data.events.length <= 5
+
+[ TC-E03 ] cursor 페이지네이션
+  선행: TC-E01에서 next_cursor 획득
+  URL: /api/security/events?before=<cursor>
+  기대: 200, 모든 이벤트 id < cursor
+
+[ TC-E04 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-E05 ] 인증 없이 접근
+  기대: 401, error.code="UNAUTHORIZED"
+
+────────────────────────────────────────
+4-2. GET /api/security/stream  (admin only, SSE)
+────────────────────────────────────────
+
+[ TC-S01 ] SSE 연결 성립 확인
+  헤더: admin JWT
+  기대:
+    응답 헤더 Content-Type: text/event-stream
+    연결 유지 (close 이벤트 전까지 응답 종료 없음)
+
+[ TC-S02 ] 신규 이벤트 수신 확인
+  선행: SSE 연결 유지 상태
+  동작: 로그인 SQLi 시도로 SQLI_BLOCKED 이벤트 생성
+  기대: SSE 스트림에 해당 이벤트 수신 (2초 이내)
+  검증: data 필드가 JSON 파싱 가능, event_type 포함 확인
+
+[ TC-S03 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+────────────────────────────────────────
+4-3. POST /api/security/ai-analyze  (admin only)
+────────────────────────────────────────
+
+[ TC-A01 ] DISABLE_AI=true 시 graceful 응답
+  환경: DISABLE_AI=true
+  헤더: admin JWT
+  기대: 503, error.code="AI_UNAVAILABLE"
+
+[ TC-A02 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-A03 ] 인증 없이 접근
+  기대: 401, error.code="UNAUTHORIZED"
+
+================================================================================
+5. 대시보드 (tests/backend/dashboard.test.js)
+================================================================================
+
+────────────────────────────────────────
+5-1. GET /api/dashboard/stats  (admin only)
+────────────────────────────────────────
+
+[ TC-DS01 ] 기본 통계 조회
+  헤더: admin JWT
+  기대:
+    200, success=true
+    data.buckets (배열, 길이 = 10)
+    data.minutes = 10
+    각 bucket: { minute: ISO 타임스탬프, counts: {} }
+
+[ TC-DS02 ] minutes 파라미터 적용
+  URL: /api/dashboard/stats?minutes=5
+  기대: 200, data.buckets.length = 5, data.minutes = 5
+
+[ TC-DS03 ] 이벤트 집계 정확성
+  선행: SQLI_BLOCKED 이벤트 2건 생성 (TC-L04, TC-L05 활용)
+  기대: 해당 분 bucket의 counts.SQLI_BLOCKED >= 2
+
+[ TC-DS04 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+────────────────────────────────────────
+5-2. GET /api/dashboard/ai-alerts  (admin only)
+────────────────────────────────────────
+
+[ TC-DA01 ] AI 권고 목록 조회
+  헤더: admin JWT
+  기대: 200, data.alerts (배열)
+
+[ TC-DA02 ] 차단된 user의 알림 필터링
+  선행: AI_ALERT 이벤트 존재 + 해당 user가 이미 차단됨
+  기대: data.alerts에 해당 user 관련 알림이 포함되지 않음
+
+[ TC-DA03 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+================================================================================
+6. 관리자 (tests/backend/admin.test.js)
+================================================================================
+
+────────────────────────────────────────
+6-1. POST /api/admin/users/:id/block  (admin only)
+────────────────────────────────────────
+
+[ TC-BK01 ] 정상 차단
+  헤더: admin JWT
+  URL: /api/admin/users/<consumer_id>/block
+  입력: { reason: "테스트 차단" }
+  기대: 200, success=true
+  검증: users.is_blocked=true, block_reason="테스트 차단", blocked_at 설정 확인
+
+[ TC-BK02 ] reason 없이 차단 (기본값 적용)
+  입력: {} (빈 바디)
+  기대: 200, success=true
+  검증: block_reason이 기본 문구로 설정됨
+
+[ TC-BK03 ] 이미 차단된 user 재차단
+  선행: TC-BK01 완료
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-BK04 ] 존재하지 않는 user_id
+  URL: /api/admin/users/00000000-0000-0000-0000-000000000000/block
+  기대: 404, error.code="NOT_FOUND"
+
+[ TC-BK05 ] consumer 토큰으로 접근
+  기대: 403, error.code="FORBIDDEN"
+
+[ TC-BK06 ] 인증 없이 접근
+  기대: 401, error.code="UNAUTHORIZED"
+
+────────────────────────────────────────
+6-2. POST /api/admin/users/:id/unblock  (admin only)
+────────────────────────────────────────
+
+[ TC-UB01 ] 정상 차단 해제
+  선행: TC-BK01로 차단된 user
+  헤더: admin JWT
+  기대: 200, success=true
+  검증: users.is_blocked=false, block_reason=null, blocked_at=null
+
+[ TC-UB02 ] 차단되지 않은 user 해제 시도
+  기대: 400, error.code="INVALID_INPUT"
+
+[ TC-UB03 ] 존재하지 않는 user_id
+  기대: 404, error.code="NOT_FOUND"
+
+================================================================================
+7. 헬스체크 (tests/backend/health.test.js)
+================================================================================
+
+[ TC-HC01 ] 서버 및 DB 정상 상태
+  URL: GET /api/health
+  기대: 200, data.server="ok", data.db="ok"
+
+[ TC-HC02 ] 인증 불필요 확인
+  헤더: 없음
+  기대: 200 (인증 없이도 접근 가능)
+
+================================================================================
+8. 보안 메커니즘 통합 검증
+================================================================================
+
+────────────────────────────────────────
+8-1. HMAC 서명 검증
+────────────────────────────────────────
+
+[ TC-HM01 ] 서명 메시지 구성 정확성
+  대상: lib/hmac.js 단위 테스트
+  검증:
+    sign(qrId, merchantId, 36.35044, 127.38454) 의 메시지가
+    "${qrId}:${merchantId}:36.3504:127.3845" 임을 확인 (toFixed(4) 적용)
+
+[ TC-HM02 ] verify — 정상 케이스
+  검증: sign으로 생성한 서명을 verify로 검증 시 true 반환
+
+[ TC-HM03 ] verify — 서명 1자 변경
+  검증: 서명 마지막 문자를 바꾸면 false 반환
+
+[ TC-HM04 ] verify — 빈 서명
+  검증: verify(..., '') → false
+
+[ TC-HM05 ] Haversine 거리 계산 정확성
+  대상: lib/haversine.js 단위 테스트
+  케이스:
+    동일 좌표 → 0m
+    대전(36.3504, 127.3845) ↔ 서울(37.5665, 126.9780) → 약 148,000m ± 1%
+    100m 간격 좌표 → 약 100m ± 1m
+
+────────────────────────────────────────
+8-2. Rate Limit + 계정 잠금 연동
+────────────────────────────────────────
+
+[ TC-RL01 ] Rate limit 해제 후 재접근
+  선행: Rate limit 발생 (11회 요청)
+  대기: 60초 경과 후 재요청
+  기대: 429 아닌 응답 (401 또는 200)
+
+[ TC-RL02 ] Rate limit은 IP 단위임을 확인
+  선행: IP-A에서 rate limit 발생
+  요청: IP-B에서 로그인 시도
+  기대: 429 아닌 응답
+
+[ TC-RL03 ] Rate limit과 계정 잠금 순서
+  동작: Rate limit 상태에서도 계정 잠금 확인 요청
+  기대: Rate limit이 계정 잠금보다 먼저 체크됨 (429 반환)
+
+────────────────────────────────────────
+8-3. 차단 계정 전체 흐름
+────────────────────────────────────────
+
+[ TC-BL01 ] 차단된 계정 로그인 시도
+  선행: consumer 차단
+  기대: 403, error.code="USER_BLOCKED", message=block_reason
+
+[ TC-BL02 ] 차단된 계정 결제 시도
+  선행: consumer 차단 + 유효한 QR 존재
+  기대: 403, error.code="USER_BLOCKED"
+
+[ TC-BL03 ] 차단 해제 후 정상 로그인 가능
+  선행: TC-BL01 → 차단 해제 → 로그인 재시도
+  기대: 200, data.token 반환
+
+================================================================================
+9. 테스트 데이터 설정 가이드
+================================================================================
+
+테스트 전 필요한 계정:
+  merchant_email = "merchant_test@grip.local"  password = "Password1!"  role = "merchant"
+  consumer_email = "consumer_test@grip.local"  password = "Password1!"  role = "consumer"
+  admin_email    = "admin_test@grip.local"     password = "Password1!"  role = "admin"
+
+초기 잔액:
+  consumer: 100,000원 이상 (가입 시 트리거로 지급 또는 직접 설정)
+
+테스트 후 정리:
+  차단된 계정은 unblock 처리
+  locked_until는 직접 DB에서 초기화
+
+================================================================================
+10. 테스트 파일 구조
+================================================================================
+
+tests/backend/
+├── auth.test.js       # TC-R*, TC-L*, TC-O*
+├── payments.test.js   # TC-QR*, TC-V*, TC-H*
+├── security.test.js   # TC-E*, TC-S*, TC-A*
+├── dashboard.test.js  # TC-DS*, TC-DA*
+├── admin.test.js      # TC-BK*, TC-UB*
+├── health.test.js     # TC-HC*
+└── lib.test.js        # TC-HM* (hmac, haversine 단위 테스트)
+
+================================================================================
+11. 통과 기준
+================================================================================
+
+필수 통과 (PHASE 2_BACKEND_TEST 통과 요건):
+  - 모든 정상 응답 케이스 (TC-*01, *02 계열) 통과
+  - 모든 인증/인가 케이스 (UNAUTHORIZED, FORBIDDEN) 통과
+  - QR 위변조 탐지 3종 (INVALID_QR, REPLAY_QR, INVALID_QR-expired) 통과
+  - LOCATION_MISMATCH 탐지 통과
+  - SQLi 탐지 전체 패턴 통과
+  - Rate limit + 계정 잠금 통과
+  - 차단/해제 통합 흐름 통과
+
+실패 시: PHASE=2_BACKEND로 복귀, 해당 케이스만 수정

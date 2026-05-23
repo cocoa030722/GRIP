@@ -11,7 +11,7 @@
 ## Current Phase
 
 ```
-PHASE=1_SCHEMA
+PHASE=2_BACKEND
 ```
 
 > 페이즈 변경 시 위 값만 수정한다.  

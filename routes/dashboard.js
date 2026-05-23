@@ -1,5 +1,9 @@
 const { Router } = require('express');
 const router = Router();
-// TODO:PHASE2_BACKEND - GET /stats, GET /ai-alerts
-// TODO:PHASE2_BACKEND - POST /admin/users/:id/block, POST /admin/users/:id/unblock
+const authMiddle = require('../middleware/auth.middleware');
+const { getStats, getAiAlerts } = require('../controllers/dashboard.controller');
+
+router.get('/stats',     authMiddle, getStats);
+router.get('/ai-alerts', authMiddle, getAiAlerts);
+
 module.exports = router;
