@@ -5,27 +5,27 @@ const EVENT_TYPES = [
 ];
 
 const CHART_COLORS = {
-  SQLI_DETECTED:     '#dc2626',
-  LOGIN_FAIL:        '#ea580c',
-  ACCOUNT_LOCKED:    '#b91c1c',
-  INVALID_QR:        '#7c3aed',
-  REPLAY_QR:         '#6d28d9',
+  SQLI_DETECTED: '#dc2626',
+  LOGIN_FAIL: '#ea580c',
+  ACCOUNT_LOCKED: '#b91c1c',
+  INVALID_QR: '#7c3aed',
+  REPLAY_QR: '#6d28d9',
   LOCATION_MISMATCH: '#d97706',
-  PAYMENT_OK:        '#16a34a',
-  AI_ALERT:          '#0891b2',
+  PAYMENT_OK: '#16a34a',
+  AI_ALERT: '#0891b2',
 };
 
 const DOT_CLASS_MAP = {
-  SQLI_DETECTED:     'sqli',
-  SQLI_BLOCKED:      'sqli',
-  LOGIN_FAIL:        'brute',
-  BRUTE_FORCE:       'brute',
-  ACCOUNT_LOCKED:    'brute',
-  INVALID_QR:        'qr',
-  REPLAY_QR:         'qr',
+  SQLI_DETECTED: 'sqli',
+  SQLI_BLOCKED: 'sqli',
+  LOGIN_FAIL: 'brute',
+  BRUTE_FORCE: 'brute',
+  ACCOUNT_LOCKED: 'brute',
+  INVALID_QR: 'qr',
+  REPLAY_QR: 'qr',
   LOCATION_MISMATCH: 'qr',
-  PAYMENT_OK:        'ok',
-  AI_ALERT:          'ai',
+  PAYMENT_OK: 'ok',
+  AI_ALERT: 'ai',
 };
 
 let chart = null;
@@ -60,10 +60,10 @@ function initSSE() {
       const event = JSON.parse(e.data);
       prependFeedItem(event);
       if (event.event_type === 'AI_ALERT') prependAiAlert(event);
-    } catch {}
+    } catch { }
   };
 
-  es.onerror = () => {};
+  es.onerror = () => { };
 }
 
 // ================================================================
@@ -183,7 +183,7 @@ async function loadAiAlerts() {
   if (!ok) return;
 
   const alerts = data.data?.alerts || [];
-  const list   = document.getElementById('alertsList');
+  const list = document.getElementById('alertsList');
 
   list.innerHTML = '';
   alerts.forEach((alert) => list.appendChild(buildAlertCard(alert)));
@@ -191,10 +191,10 @@ async function loadAiAlerts() {
 }
 
 function buildAlertCard(alert) {
-  const risk     = alert.detail?.risk_level || 'low';
-  const email    = alert.user?.email || '(알 수 없음)';
+  const risk = alert.detail?.risk_level || 'low';
+  const email = alert.user?.email || '(알 수 없음)';
   const patterns = (alert.detail?.patterns || []).join(', ');
-  const reason   = alert.detail?.reason || '';
+  const reason = alert.detail?.reason || '';
 
   const article = document.createElement('article');
   article.className = `alert-card alert-card--${risk}`;
@@ -206,7 +206,7 @@ function buildAlertCard(alert) {
     </header>
     <p class="alert-user">사용자: ${email}</p>
     ${patterns ? `<p class="alert-patterns">감지 패턴: ${patterns}</p>` : ''}
-    ${reason   ? `<p class="alert-reason">사유: ${reason}</p>`          : ''}
+    ${reason ? `<p class="alert-reason">사유: ${reason}</p>` : ''}
     <footer class="alert-actions">
       <button class="btn btn-danger" data-user-id="${alert.user_id}">차단</button>
       <button class="btn btn-ghost"  data-alert-id="${alert.id}">무시</button>
@@ -226,7 +226,7 @@ function prependAiAlert(event) {
 }
 
 function evaluateEmpty() {
-  const list  = document.getElementById('alertsList');
+  const list = document.getElementById('alertsList');
   const empty = document.getElementById('alertsEmpty');
   empty.classList.toggle('hidden', list.children.length > 0);
 }
@@ -237,7 +237,7 @@ function evaluateEmpty() {
 
 async function handleBlockUser(e) {
   const userId = e.currentTarget.dataset.userId;
-  const card   = e.currentTarget.closest('.alert-card');
+  const card = e.currentTarget.closest('.alert-card');
 
   const { ok, data } = await API.api('POST', `/admin/users/${userId}/block`, {});
   if (!ok) {
@@ -265,12 +265,12 @@ function handleDismissAlert(e) {
 
 async function handleAiAnalyze() {
   const btn = document.getElementById('aiAnalyzeBtn');
-  btn.disabled    = true;
+  btn.disabled = true;
   btn.textContent = '분석 중...';
 
   await API.api('POST', '/security/ai-analyze', {});
 
-  btn.disabled    = false;
+  btn.disabled = false;
   btn.textContent = '즉시 분석 실행';
   await loadAiAlerts();
 }

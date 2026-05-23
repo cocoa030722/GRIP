@@ -99,6 +99,14 @@ async function login(req, res) {
 
   // 계정 잠금 확인
   if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    // 잠긴 상태에서 계속 로그인 시도 시 BRUTE_FORCE 이벤트 로깅 (스키마 제약조건 준수)
+    supabaseAdmin.from('security_events').insert({
+      event_type: 'BRUTE_FORCE',
+      ip: req.ip,
+      user_id: user.id,
+      detail: { message: '잠긴 계정에 대한 로그인 시도 차단' }
+    }).then(() => {}).catch(() => {});
+
     return res.status(403).json({
       success: false,
       error: {
@@ -119,6 +127,14 @@ async function login(req, res) {
     if (newCount >= 5) {
       updates.locked_until = new Date(Date.now() + 30 * 60 * 1000).toISOString();
       updates.failed_login_count = 0;
+
+      // BRUTE_FORCE 보안 이벤트 로깅 추가
+      supabaseAdmin.from('security_events').insert({
+        event_type: 'BRUTE_FORCE',
+        ip: req.ip,
+        user_id: user.id,
+        detail: { message: '비밀번호 5회 연속 실패로 계정 잠금' }
+      }).then(() => {}).catch(() => {});
     }
 
     await supabaseAdmin.from('users').update(updates).eq('id', user.id);
